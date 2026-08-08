@@ -263,7 +263,12 @@ function Install-Binary {
     $BinaryUrl = "https://github.com/$Repo/releases/download/$Latest/$BinaryName"
     Write-Host "Downloading $BinaryName..."
     $OutPath = Join-Path $InstallDir "omp.exe"
-    Invoke-WebRequest -Uri $BinaryUrl -OutFile $OutPath -TimeoutSec 900
+    # Download to a temp file, then rename into place: an interrupted download
+    # must not leave a truncated binary at the live path, and upgrades should
+    # swap atomically (mirrors the fix in scripts/install.sh).
+    $TmpPath = "$OutPath.tmp"
+    Invoke-WebRequest -Uri $BinaryUrl -OutFile $TmpPath -TimeoutSec 900
+    Move-Item -Force -Path $TmpPath -Destination $OutPath
 
     Write-Host ""
     Write-Host "[OK] Installed omp to $OutPath" -ForegroundColor Green

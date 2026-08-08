@@ -262,32 +262,51 @@ install_binary() {
     echo "Using version: $LATEST"
 
     mkdir -p "$INSTALL_DIR"
-    # Download binary
+    # Download to a temp file in the same directory, then atomically rename it
+    # into place. Writing straight to "${INSTALL_DIR}/omp" with `curl -o`
+    # truncates and rewrites the existing file in place, and macOS caches a
+    # signed binary's code signature per-vnode: on an upgrade the kernel's
+    # cached page hashes go stale, so the next exec is SIGKILL'd (exit 137)
+    # before main() runs. Renaming gives the binary a fresh inode so the
+    # signature is re-read — mirroring what `omp update` already does. The temp
+    # file lives in the same directory so the rename is a same-filesystem swap,
+    # not a copy, and an interrupted download leaves the previous install
+    # intact instead of a truncated binary.
     BINARY_URL="https://github.com/${REPO}/releases/download/${LATEST}/${BINARY}"
     echo "Downloading ${BINARY}..."
-    curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 30 "$BINARY_URL" -o "${INSTALL_DIR}/omp"
-    chmod +x "${INSTALL_DIR}/omp"
+    TMP="$(mktemp "${INSTALL_DIR}/.omp.XXXXXX")"
+    trap 'rm -f "$TMP"' EXIT HUP INT TERM
+    curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 30 "$BINARY_URL" -o "$TMP"
+    # Strip download-time extended attributes (e.g. com.apple.provenance on
+    # macOS 26); part of the empirically verified remedy for the startup
+    # SIGKILL, along with the fresh inode. No-op where xattr doesn't exist.
+    xattr -c "$TMP" 2>/dev/null || true
+    chmod 755 "$TMP"
 
-    # Verify the freshly installed binary can actually start before reporting
-    # success. Bun's musl-target binaries link libstdc++/libgcc dynamically,
-    # which stock Alpine/musl systems do not ship, so the download succeeds while
-    # the binary exits 127 with relocation errors. Never claim success for a
-    # binary that cannot run.
-    if ! SMOKE_OUTPUT="$("${INSTALL_DIR}/omp" --version 2>&1)"; then
+    # Verify the freshly downloaded binary can actually start before replacing
+    # anything. Bun's musl-target binaries link libstdc++/libgcc dynamically,
+    # which stock Alpine/musl systems do not ship, so the download succeeds
+    # while the binary exits 127 with relocation errors. Running this on the
+    # temp file (pre-swap) means a bad or rejected binary never clobbers the
+    # previous working install.
+    if ! SMOKE_OUTPUT="$("$TMP" --version 2>&1)"; then
         echo ""
-        echo "✗ omp was downloaded to ${INSTALL_DIR}/omp but cannot start:"
+        echo "✗ downloaded binary cannot start:"
         echo "$SMOKE_OUTPUT" | sed 's/^/    /'
         if [ "$PLATFORM" = "linux-musl" ]; then
             echo ""
-            echo "The musl build links libstdc++/libgcc dynamically. Install them, then re-run 'omp':"
+            echo "The musl build links libstdc++/libgcc dynamically. Install them, then re-run the installer:"
             if command -v apk >/dev/null 2>&1; then
                 echo "    apk add libstdc++ libgcc"
             else
                 echo "    (install the libstdc++ and libgcc runtime packages for your distro)"
             fi
         fi
+        echo "Refusing to replace ${INSTALL_DIR}/omp; the previous install is left intact."
         exit 1
     fi
+    mv -f "$TMP" "${INSTALL_DIR}/omp"
+    trap - EXIT HUP INT TERM
 
     echo ""
     echo "✓ Installed omp to ${INSTALL_DIR}/omp"
